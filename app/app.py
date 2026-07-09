@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from app.db import Post, create_db_and_tables, get_async_session, User
 from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager
@@ -19,7 +20,17 @@ async def lifespan(app: FastAPI):
     await create_db_and_tables()
     yield
 
+
 app = FastAPI(lifespan=lifespan)
+
+# -------------------- CORS --------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -------------------- User Management --------------------
 app.include_router(fastapi_users.get_auth_router(auth_backend), prefix="/auth/jwt", tags=["auth"])
@@ -27,7 +38,7 @@ app.include_router(fastapi_users.get_register_router(UserRead, UserCreate), pref
 app.include_router(fastapi_users.get_reset_password_router(), prefix="/auth", tags=["auth"])
 app.include_router(fastapi_users.get_verify_router(UserRead), prefix="/auth", tags=["auth"])
 app.include_router(fastapi_users.get_users_router(UserRead, UserUpdate), prefix="/users", tags=["users"])
-                                                                                    
+
 
 # -------------------- Upload Endpoint --------------------
 @app.post("/upload")
@@ -39,11 +50,10 @@ async def upload_file(
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file uploaded")
-    
+
     temp_file_path = None
 
     try:
-        # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(
             delete=False,
             suffix=os.path.splitext(file.filename)[1]
@@ -51,18 +61,16 @@ async def upload_file(
             temp_file_path = temp_file.name
             shutil.copyfileobj(file.file, temp_file)
 
-        # Upload to ImageKit (v5 syntax - use files.upload)
         with open(temp_file_path, "rb") as f:
             upload_result = await run_in_threadpool(
-                imagekit.files.upload,  # Changed from imagekit.upload
+                imagekit.files.upload,
                 file=f,
                 file_name=file.filename,
-                folder="/uploads",  # Optional: organize uploads
-                tags=["backend-upload"],  # Tags are directly in kwargs, not in options
+                folder="/uploads",
+                tags=["backend-upload"],
                 use_unique_file_name=True
             )
-   
-        # upload_result is a Pydantic model in v5, access attributes directly
+
         post = Post(
             user_id=user.id,
             caption=caption,
@@ -78,13 +86,14 @@ async def upload_file(
 
     except HTTPException:
         raise
-    except Exception:
-        raise HTTPException(status_code=500, detail="Upload failed")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
             os.unlink(temp_file_path)
         await file.close()
+
 
 # -------------------- Feed Endpoint --------------------
 @app.get("/feed")
@@ -100,7 +109,6 @@ async def get_feed(
     result = await session.execute(select(User))
     users = [row[0] for row in result.all()]
     user_dict = {u.id: u.email for u in users}
-
 
     return {
         "posts": [
@@ -119,6 +127,8 @@ async def get_feed(
         ]
     }
 
+
+# -------------------- Delete Endpoint --------------------
 @app.delete("/post/{post_id}")
 async def delete_post(
     post_id: str,
@@ -127,22 +137,21 @@ async def delete_post(
 ):
     try:
         post_id_uuid = uuid.UUID(post_id)
-        result = await session.execute(
-            select(Post).where(Post.id == post_id_uuid)
-        )
-        post = result.scalar_one_or_none()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid post ID")
 
-        if not post:
-            raise HTTPException(status_code=404, detail="Post not found")
-    
-        if post.user_id != user.id:
-            raise HTTPException(status_code=403, detail="Not authorized to delete this post")
+    result = await session.execute(
+        select(Post).where(Post.id == post_id_uuid)
+    )
+    post = result.scalar_one_or_none()
 
-        session.delete(post)
-        await session.commit()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
 
-        return {"detail": "Post deleted successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
+    if post.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this post")
 
+    await session.delete(post)
+    await session.commit()
+
+    return {"detail": "Post deleted successfully"}
